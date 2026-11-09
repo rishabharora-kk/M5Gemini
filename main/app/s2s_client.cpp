@@ -1,5 +1,6 @@
 #include "s2s_client.h"
 #include "audio_buffer.h"
+#include "agent_link.h"
 #include "esp_websocket_client.h"
 #include "esp_log.h"
 #include "mjson.h"
@@ -10,6 +11,8 @@
 #include <cstring>
 #include "esp_rom_crc.h"
 #include <format>
+#include <deque>
+#include <vector>
 
 static const char* TAG = "S2S";
 
@@ -74,6 +77,87 @@ typedef struct
 } s2s_context_t;
 
 static s2s_context_t s2s_ctx;
+
+// ─── Outgoing messages from other tasks (tool responses, task results), sent by the session task ───
+static std::deque<std::string> s_outq;
+static SemaphoreHandle_t s_outq_mtx = nullptr;
+static bool s_tools_enabled = false; // an agent is paired, so the model gets the do_task tool
+
+void s2s_enqueue_out(const std::string& json)
+{
+    if (!s_outq_mtx)
+        return;
+    if (xSemaphoreTake(s_outq_mtx, pdMS_TO_TICKS(200)) == pdTRUE)
+    {
+        if (s_outq.size() < 8)
+            s_outq.push_back(json);
+        xSemaphoreGive(s_outq_mtx);
+    }
+}
+
+static void s2s_flush_outq(s2s_context_t* ctx)
+{
+    while (true)
+    {
+        std::string msg;
+        if (!s_outq_mtx || xSemaphoreTake(s_outq_mtx, 0) != pdTRUE)
+            return;
+        if (!s_outq.empty())
+        {
+            msg = std::move(s_outq.front());
+            s_outq.pop_front();
+        }
+        xSemaphoreGive(s_outq_mtx);
+        if (msg.empty())
+            return;
+        esp_websocket_client_send_text(ctx->ws_client, msg.data(), msg.size(), pdMS_TO_TICKS(3000));
+    }
+}
+
+// The agent finished: tell the model, which then speaks the outcome.
+static void s2s_on_task_result(const std::string& text, bool ok)
+{
+    std::string msg = std::string("[task result] ") + (ok ? "" : "(failed) ") + text;
+    std::vector<char> b(msg.size() * 6 + 64);
+    mjson_snprintf(b.data(), b.size(), "{\"realtimeInput\":{\"text\":%Q}}", msg.c_str());
+    s2s_enqueue_out(b.data());
+}
+
+// The model asked for a tool. do_task hands the request to the PC agent and answers at once;
+// the agent's report comes back later through s2s_on_task_result.
+static void s2s_handle_tool_call(const char* buf, int len)
+{
+    static char task[2100];
+    for (int i = 0; i < 4; i++)
+    {
+        char path[72], id[64] = "", name[32];
+        snprintf(path, sizeof(path), "$.toolCall.functionCalls[%d].name", i);
+        if (mjson_get_string(buf, len, path, name, sizeof(name)) < 0)
+            break;
+        snprintf(path, sizeof(path), "$.toolCall.functionCalls[%d].id", i);
+        mjson_get_string(buf, len, path, id, sizeof(id));
+        std::string result = "unknown tool";
+        if (strcmp(name, "do_task") == 0)
+        {
+            task[0] = '\0';
+            snprintf(path, sizeof(path), "$.toolCall.functionCalls[%d].args.task", i);
+            mjson_get_string(buf, len, path, task, sizeof(task));
+            std::string err = agent_submit(task);
+            result = err.empty() ? "started. The result will arrive later as a message starting with [task result]. "
+                                   "Tell the user briefly that you are on it."
+                                 : err;
+        }
+        ESP_LOGI(TAG, "tool %s -> %s", name, result.c_str());
+        char out[700];
+        mjson_snprintf(out,
+                       sizeof(out),
+                       "{\"toolResponse\":{\"functionResponses\":[{\"id\":%Q,\"name\":%Q,\"response\":{\"result\":%Q}}]}}",
+                       id,
+                       name,
+                       result.c_str());
+        s2s_enqueue_out(out);
+    }
+}
 
 // ─── Forward declarations ───
 static void s2s_process_message(s2s_context_t* ctx);
@@ -376,6 +460,13 @@ static void s2s_process_message(s2s_context_t* ctx)
         return;
     }
 
+    // ── Tool call ──
+    if (mjson_find(buf, len, "$.toolCall", &tp, &tl) != MJSON_TOK_INVALID)
+    {
+        s2s_handle_tool_call(buf, len);
+        return;
+    }
+
     // ── Go away ──
     if (mjson_find(buf, len, "$.goAway", &tp, &tl) != MJSON_TOK_INVALID)
     {
@@ -461,13 +552,27 @@ static bool s2s_send_setup(s2s_context_t* ctx)
                        ctx->voice.c_str());
     }
 
-    char rules_snippet[1200] = "";
-    if (!ctx->rules.empty())
+    std::string rules = ctx->rules;
+    const char* tools_snippet = "";
+    if (s_tools_enabled)
+    {
+        rules += " When the user asks you to do something on their computer, not just talk, call do_task with the "
+                 "request. Say briefly that you are on it. When a message starting with [task result] arrives, tell "
+                 "the user the outcome in one or two short sentences.";
+        tools_snippet =
+            "\"tools\":[{\"functionDeclarations\":[{\"name\":\"do_task\",\"description\":\"Ask the user's computer assistant "
+            "(Claude Code) to do something on their PC: look things up, read or edit files, run commands, check "
+            "status. It takes a while; the result arrives later as a message starting with [task result].\","
+            "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"task\":{\"type\":\"STRING\",\"description\":\"The task in "
+            "plain language, with everything needed to do it.\"}},\"required\":[\"task\"]}}]}],";
+    }
+    char rules_snippet[1600] = "";
+    if (!rules.empty())
     {
         mjson_snprintf(rules_snippet,
                        sizeof(rules_snippet),
                        "\"systemInstruction\":{\"parts\":[{\"text\":%Q}]},",
-                       ctx->rules.c_str());
+                       rules.c_str());
     }
 
     char handle_snippet[200] = "";
@@ -484,13 +589,14 @@ static bool s2s_send_setup(s2s_context_t* ctx)
                      "{\"setup\":{"
                      "\"model\":\"%s\","
                      "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]%s},"
-                     "%s"
+                     "%s%s"
                      "\"inputAudioTranscription\":{},"
                      "\"outputAudioTranscription\":{},"
                      "\"sessionResumption\":{%s}"
                      "}}",
                      model_path.c_str(),
                      voice_snippet,
+                     tools_snippet,
                      rules_snippet,
                      handle_snippet);
 
@@ -606,6 +712,7 @@ static void s2s_client_task(void* parameter)
 
         while (true)
         {
+            s2s_flush_outq(ctx);
             bits = xEventGroupGetBits(ctx->event_group);
             if (bits & (S2S_STOP_REQUEST_BIT | S2S_ERROR_BIT | S2S_MODEL_SPEAKING_BIT | S2S_USER_INTERRUPT_BIT))
                 break;
@@ -854,6 +961,16 @@ bool s2s_start(HAL::Hal* hal,
 
     // Clear bits
     xEventGroupClearBits(event_group, 0xFFFFFF);
+
+    if (!s_outq_mtx)
+        s_outq_mtx = xSemaphoreCreateMutex();
+    if (xSemaphoreTake(s_outq_mtx, pdMS_TO_TICKS(200)) == pdTRUE)
+    {
+        s_outq.clear();
+        xSemaphoreGive(s_outq_mtx);
+    }
+    s_tools_enabled = agent_init(hal->settings()->getString("gemini", "agent_code"), s2s_on_task_result);
+    ESP_LOGI(TAG, "agent tools %s", s_tools_enabled ? "on" : "off");
 
     memset(&s2s_ctx, 0, sizeof(s2s_ctx));
     s2s_ctx.hal = hal;

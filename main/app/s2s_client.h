@@ -40,3 +40,6 @@ bool s2s_start(HAL::Hal* hal, EventGroupHandle_t event_group, S2SSharedData* sha
                int32_t volume);
 
 void s2s_stop(void);
+
+// Queues one JSON message for the websocket; the session task sends it (never send from another task).
+void s2s_enqueue_out(const std::string& json);
