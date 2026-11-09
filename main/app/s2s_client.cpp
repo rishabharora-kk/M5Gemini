@@ -114,12 +114,20 @@ static void s2s_flush_outq(s2s_context_t* ctx)
     }
 }
 
-// The agent finished: tell the model, which then speaks the outcome.
+static std::string s_call_id, s_call_name; // the do_task call that is waiting for its result
+
+// The agent finished: answer the pending non-blocking do_task call. The model speaks the outcome when idle.
 static void s2s_on_task_result(const std::string& text, bool ok)
 {
-    std::string msg = std::string("[task result] ") + (ok ? "" : "(failed) ") + text;
-    std::vector<char> b(msg.size() * 6 + 64);
-    mjson_snprintf(b.data(), b.size(), "{\"realtimeInput\":{\"text\":%Q}}", msg.c_str());
+    std::string msg = ok ? text : "failed: " + text;
+    std::vector<char> b(msg.size() * 6 + 256);
+    mjson_snprintf(b.data(),
+                   b.size(),
+                   "{\"toolResponse\":{\"functionResponses\":[{\"id\":%Q,\"name\":%Q,\"response\":{\"result\":%Q,"
+                   "\"scheduling\":\"WHEN_IDLE\"}}]}}",
+                   s_call_id.c_str(),
+                   s_call_name.c_str(),
+                   msg.c_str());
     s2s_enqueue_out(b.data());
 }
 
@@ -142,10 +150,12 @@ static void s2s_handle_tool_call(const char* buf, int len)
             task[0] = '\0';
             snprintf(path, sizeof(path), "$.toolCall.functionCalls[%d].args.task", i);
             mjson_get_string(buf, len, path, task, sizeof(task));
+            s_call_id = id;
+            s_call_name = name;
             std::string err = agent_submit(task);
-            result = err.empty() ? "started. The result will arrive later as a message starting with [task result]. "
-                                   "Tell the user briefly that you are on it."
-                                 : err;
+            if (err.empty())
+                continue; // answered later, by s2s_on_task_result
+            result = err;
         }
         ESP_LOGI(TAG, "tool %s -> %s", name, result.c_str());
         char out[700];
@@ -557,12 +567,12 @@ static bool s2s_send_setup(s2s_context_t* ctx)
     if (s_tools_enabled)
     {
         rules += " When the user asks you to do something on their computer, not just talk, call do_task with the "
-                 "request. Say briefly that you are on it. When a message starting with [task result] arrives, tell "
+                 "request. Say briefly that you are on it. The result comes back on its own later; then tell "
                  "the user the outcome in one or two short sentences.";
         tools_snippet =
-            "\"tools\":[{\"functionDeclarations\":[{\"name\":\"do_task\",\"description\":\"Ask the user's computer assistant "
+            "\"tools\":[{\"functionDeclarations\":[{\"name\":\"do_task\",\"behavior\":\"NON_BLOCKING\",\"description\":\"Ask the user's computer assistant "
             "(Claude Code) to do something on their PC: look things up, read or edit files, run commands, check "
-            "status. It takes a while; the result arrives later as a message starting with [task result].\","
+            "status. It takes a while; the result comes back when it is done.\","
             "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"task\":{\"type\":\"STRING\",\"description\":\"The task in "
             "plain language, with everything needed to do it.\"}},\"required\":[\"task\"]}}]}],";
     }
@@ -969,7 +979,8 @@ bool s2s_start(HAL::Hal* hal,
         s_outq.clear();
         xSemaphoreGive(s_outq_mtx);
     }
-    s_tools_enabled = agent_init(hal->settings()->getString("gemini", "agent_code"), s2s_on_task_result);
+    s_tools_enabled = agent_init(hal->settings()->getString("gemini", "agent_code"), s2s_on_task_result) &&
+                       model.find("3.8") != std::string::npos;
     ESP_LOGI(TAG, "agent tools %s", s_tools_enabled ? "on" : "off");
 
     memset(&s2s_ctx, 0, sizeof(s2s_ctx));

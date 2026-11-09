@@ -1,7 +1,6 @@
 #include "dialog.h"
 #include "esp_log.h"
 #include "app/utils/anim/hl_text.h"
-#include "app/utils/screenshot/screenshot_tools.h"
 #include "lgfx/v1/misc/enum.hpp"
 #include "app/utils/text/text_utils.h"
 #include "key_repeat.h"
@@ -314,7 +313,6 @@ namespace UTILS
                     hal->canvas_update();
                     need_update = false;
                 }
-                UTILS::SCREENSHOT_TOOLS::check_and_handle_screenshot(hal, nullptr);
                 delay(5);
             }
         }
@@ -555,7 +553,6 @@ namespace UTILS
                                THEME_COLOR_BG);
 
                 hal->canvas_update();
-                UTILS::SCREENSHOT_TOOLS::check_and_handle_screenshot(hal, nullptr);
 
                 if (hal->home_button()->is_pressed())
                 {
@@ -865,7 +862,6 @@ namespace UTILS
                 }
 
                 hal->canvas_update();
-                UTILS::SCREENSHOT_TOOLS::check_and_handle_screenshot(hal, nullptr);
 
                 if (hal->home_button()->is_pressed())
                 {
@@ -1154,8 +1150,6 @@ namespace UTILS
                 // Handle input
                 hal->keyboard()->updateKeyList();
                 hal->keyboard()->updateKeysState();
-                // Screenshot support
-                UTILS::SCREENSHOT_TOOLS::check_and_handle_screenshot(hal, nullptr);
                 if (hal->keyboard()->isPressed())
                 {
                     if (hal->keyboard()->isKeyPressing(KEY_NUM_UP))
